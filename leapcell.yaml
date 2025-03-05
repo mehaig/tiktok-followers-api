@@ -1,0 +1,5 @@
+runtime: python
+startCommand: uvicorn main:app --port 8080
+buildCommand: sh prepare_playwright_env.sh
+port: 8080
+memory: 1024mb
