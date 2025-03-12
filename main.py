@@ -101,7 +101,12 @@ async def take_screenshot(url: str = Form(default="https://news.ycombinator.com"
     async with async_playwright() as p:
         # Launch Chromium browser with specific arguments
         browser = await p.chromium.launch(
-            args=["--single-process"],
+            headless=True,
+            args=[
+                '--single-process',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+            ],
         )
         # Create a new browser page
         page = await browser.new_page()
