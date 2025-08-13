@@ -1,89 +1,62 @@
-# Playwright Web Scraper (FastAPI)
+# TikTok Followers API for Leapcell.io
 
-This project is a web scraper built with Playwright and FastAPI. It opens a Chrome browser, scrapes all links from a given webpage, and displays them. The purpose of this project is to educate users on how to deploy a web-scraping service on Leapcell.
+A simple TikTok followers API designed for easy deployment to Leapcell.io.
 
 ## Features
 
-- Uses Playwright for browser automation
-- FastAPI for building the web service
-- Extracts and displays all links from a webpage
+- Scrapes TikTok follower counts using Selenium WebDriver
+- RESTful API endpoints
+- No Docker required
+- Optimized for Leapcell.io deployment
 
-## Project Structure
+## API Endpoints
+
+### Get Followers Count
 
 ```
-.
-├── main.py                      # FastAPI application entry point
-└── prepare_playwright_env.sh    # Script to set up Playwright and dependencies
+GET /followers/<username>
 ```
 
-## prepare_playwright_env.sh Explained
+Returns the follower count for the specified TikTok username.
 
-This script ensures all necessary dependencies are installed before running the scraper. It performs the following actions:
+**Example Response:**
 
-1. Installs required Python packages: `fastapi`, `uvicorn`, `pytest-playwright`, `python-multipart`, and `jinja2`.
-2. Installs Playwright along with Chromium and its dependencies for proper browser automation.
-
-### Script Content
-
-```sh
-#!/bin/sh
-
-set -e
-# Install FastAPI, Uvicorn, Pytest, and Playwright
-pip install fastapi uvicorn pytest-playwright python-multipart jinja2
-
-# Install Playwright and its dependencies
-playwright install --with-deps chromium
+```json
+{
+  "username": "mehaiscode",
+  "followers": "708",
+  "formatted_followers": "708",
+  "status": "success"
+}
 ```
 
-## Deployment on Leapcell
+### Health Check
 
-This guide walks you through setting up and deploying the project on Leapcell.
-
-### Prerequisites
-
-Ensure you have the following:
-
-- A Leapcell account
-- Python installed (recommended: Python 3.9+)
-- Playwright dependencies installed
-
-### Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/leapcell/playwright-crawler-py
-   cd playwright-crawler-py
-   ```
-2. Install dependencies and set up Playwright:
-   ```bash
-   chmod +x prepare_playwright_env.sh
-   ./prepare_playwright_env.sh
-   ```
-
-### Running Locally
-
-To start the FastAPI service, run:
-
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+```
+GET /health
 ```
 
-The application will be accessible at `http://localhost:8000`.
+Returns the health status of the service.
 
-### Deploying on Leapcell
+## How It Works
 
-1. Push your code to a GitHub repository.
-2. Log in to Leapcell and connect your repository.
-3. Ensure `prepare_playwright_env.sh` is executed before running the service.
-4. Deploy your application.
+The service uses Selenium WebDriver with Chrome in headless mode to:
 
-Once deployed, your application will be accessible via the Leapcell-generated domain.
+1. Navigate to the TikTok profile page
+2. Wait for JavaScript to render the content
+3. Extract the follower count from the page
+4. Return the data in JSON format
 
-## Contributing
+This approach is necessary because TikTok serves JavaScript-heavy content that cannot be scraped with simple HTTP requests.
 
-Feel free to submit issues or pull requests to improve this project.
+## Requirements
 
-## Contact
+- Python 3.9+
+- Chrome browser (automatically installed by webdriver-manager)
+- Selenium and Flask libraries
 
-For support, reach out via the Leapcell Discord community or email support@leapcell.io.
+## Limitations
+
+- Resource intensive (requires a full browser instance)
+- May be rate-limited by TikTok
+- Dependent on TikTok's page structure (selectors may need updating)
