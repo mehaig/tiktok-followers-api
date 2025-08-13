@@ -1,5 +1,4 @@
 import asyncio
-import aiohttp
 import re
 import json
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -116,47 +115,50 @@ def is_cache_valid(cache_entry: Dict[str, Any]) -> bool:
     """Check if cache entry is still valid"""
     return (datetime.now() - cache_entry["timestamp"]) < timedelta(seconds=app_state.cache_timeout)
 
-async def try_api_method(username: str) -> Optional[str]:
-    """Try faster API-based methods first"""
+async def try_network_requests(page, username: str) -> Optional[str]:
+    """Try to intercept network requests for faster data extraction"""
     try:
-        # TikTok has some unofficial APIs that might work
-        api_urls = [
-            f"https://www.tiktok.com/api/user/detail/?uniqueId={username}",
-            f"https://tikapi.io/api/v1/public/user/@{username}",  # Third-party API
-        ]
+        followers_data = None
         
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            for url in api_urls:
-                try:
-                    async with session.get(url, headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                    }) as response:
-                        if response.status == 200:
+        async def handle_response(response):
+            nonlocal followers_data
+            try:
+                if 'api' in response.url and ('user' in response.url or 'detail' in response.url):
+                    if response.status == 200:
+                        try:
                             data = await response.json()
-                            # Extract follower count from different API formats
-                            followers = extract_followers_from_api(data)
+                            followers = extract_followers_from_json(data)
                             if followers:
-                                logger.info(f"Got followers via API: {followers}")
-                                return followers
-                except Exception as e:
-                    logger.debug(f"API method failed for {url}: {e}")
-                    continue
-                    
+                                followers_data = followers
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        
+        # Listen for responses
+        page.on("response", handle_response)
+        
+        # Give it a moment to capture requests
+        await asyncio.sleep(1.5)
+        
+        return followers_data
+        
     except Exception as e:
-        logger.debug(f"All API methods failed: {e}")
+        logger.debug(f"Network interception failed: {e}")
     
     return None
 
-def extract_followers_from_api(data: dict) -> Optional[str]:
-    """Extract follower count from API response"""
+def extract_followers_from_json(data: dict) -> Optional[str]:
+    """Extract follower count from JSON response"""
     try:
-        # Try different possible paths in the API response
+        # Try different possible paths in the JSON response
         paths = [
             ["userInfo", "stats", "followerCount"],
             ["user", "stats", "followerCount"], 
             ["data", "follower_count"],
             ["stats", "followers"],
-            ["followerCount"]
+            ["followerCount"],
+            ["user", "followerCount"]
         ]
         
         for path in paths:
@@ -164,7 +166,7 @@ def extract_followers_from_api(data: dict) -> Optional[str]:
             try:
                 for key in path:
                     value = value[key]
-                if isinstance(value, (int, str)) and str(value).isdigit():
+                if isinstance(value, (int, str)) and str(value).replace(',', '').isdigit():
                     return str(value)
             except (KeyError, TypeError):
                 continue
@@ -174,7 +176,7 @@ def extract_followers_from_api(data: dict) -> Optional[str]:
     return None
 
 async def scrape_with_playwright(username: str) -> Optional[str]:
-    """Fallback to Playwright scraping with optimizations"""
+    """Optimized Playwright scraping with network interception"""
     url = f"https://www.tiktok.com/@{username}"
     page = None
     
@@ -184,19 +186,61 @@ async def scrape_with_playwright(username: str) -> Optional[str]:
         page = await app_state.context.new_page()
         
         # Block unnecessary resources for speed
-        await page.route("**/*.{png,jpg,jpeg,gif,webp,css,woff,woff2}", lambda route: route.abort())
+        await page.route("**/*.{png,jpg,jpeg,gif,webp,css,woff,woff2,mp4,mov}", lambda route: route.abort())
+        
+        # Try to intercept network requests first
+        followers_from_network = None
+        
+        async def handle_response(response):
+            nonlocal followers_from_network
+            try:
+                if ('api' in response.url or 'www.tiktok.com' in response.url) and response.status == 200:
+                    try:
+                        text = await response.text()
+                        # Look for JSON data with follower count
+                        if 'followerCount' in text or 'stats' in text:
+                            try:
+                                data = json.loads(text)
+                                followers = extract_followers_from_json(data)
+                                if followers:
+                                    followers_from_network = followers
+                            except:
+                                # Try regex on the text response
+                                patterns = [
+                                    r'"followerCount["\']?:\s*["\']?(\d+)',
+                                    r'followerCount["\']:\s*(\d+)',
+                                    r'"followers["\']?:\s*["\']?(\d+)'
+                                ]
+                                for pattern in patterns:
+                                    matches = re.findall(pattern, text)
+                                    if matches:
+                                        followers_from_network = matches[0]
+                                        break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        
+        page.on("response", handle_response)
         
         # Navigate with optimizations
-        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
         
-        # Wait for key elements to load
-        await page.wait_for_timeout(2000)
+        # Wait for network requests and page to stabilize
+        await page.wait_for_timeout(3000)
         
-        # Fast selector strategy - try most reliable first
+        # Check if we got data from network interception
+        if followers_from_network:
+            logger.info(f"Found followers via network interception: {followers_from_network}")
+            return followers_from_network
+        
+        # Fallback to DOM scraping with optimized selectors
         selectors = [
             '[data-e2e="followers-count"]',
+            'strong[data-e2e="followers-count"]',
             'strong[title*="Followers"]',
             '[title*="Followers"] strong',
+            'div[data-e2e="followers-count"]',
         ]
         
         for selector in selectors:
@@ -204,27 +248,398 @@ async def scrape_with_playwright(username: str) -> Optional[str]:
                 element = await page.wait_for_selector(selector, timeout=3000)
                 if element:
                     text = await element.text_content()
-                    if text and re.match(r'^[\d,.KMBkmb]+$', text.strip()):
+                    if text and re.match(r'^[\d,.KMBkmb]+
+
+async def get_followers_count(username: str) -> Optional[str]:
+    """Main function to get followers count using optimized Playwright"""
+    cache_key = get_cache_key(username)
+    
+    # Check cache first
+    if cache_key in app_state.cache:
+        cache_entry = app_state.cache[cache_key]
+        if is_cache_valid(cache_entry):
+            logger.info(f"Cache hit for {username}")
+            return cache_entry["followers"]
+        else:
+            del app_state.cache[cache_key]
+    
+    # Use optimized Playwright scraping
+    followers = await scrape_with_playwright(username)
+    
+    # Cache successful results
+    if followers:
+        app_state.cache[cache_key] = {
+            "followers": followers,
+            "timestamp": datetime.now()
+        }
+    
+    return followers
+
+def format_followers(count: str) -> dict:
+    """Format followers count with multiple representations"""
+    if not count:
+        return {"raw": "0", "formatted": "Unknown", "numeric": 0}
+    
+    # Handle K, M, B suffixes
+    multipliers = {"K": 1000, "M": 1000000, "B": 1000000000, "k": 1000, "m": 1000000, "b": 1000000000}
+    
+    numeric_value = 0
+    raw_count = count
+    
+    if count.isdigit():
+        numeric_value = int(count)
+        formatted_count = f"{numeric_value:,}"
+    else:
+        suffix = count[-1]
+        if suffix in multipliers:
+            try:
+                number = float(count[:-1])
+                numeric_value = int(number * multipliers[suffix])
+                formatted_count = f"{numeric_value:,}"
+            except ValueError:
+                formatted_count = count
+        else:
+            formatted_count = count
+    
+    return {
+        "raw": raw_count,
+        "formatted": formatted_count,
+        "numeric": numeric_value
+    }
+
+async def process_queue():
+    """Background task to process requests with rate limiting"""
+    while True:
+        try:
+            # Process queue items with delay to avoid rate limiting
+            if not app_state.request_queue.empty():
+                await asyncio.sleep(1)  # Rate limit: 1 request per second
+        except Exception as e:
+            logger.error(f"Queue processing error: {e}")
+        await asyncio.sleep(0.1)
+
+# API Routes
+@app.get("/")
+async def home():
+    return {
+        "message": "Optimized TikTok Followers API",
+        "version": "2.0",
+        "features": ["Caching", "Rate Limiting", "Multiple Data Sources", "Performance Optimized"],
+        "endpoints": {
+            "/followers/{username}": "Get followers count for a TikTok user",
+            "/health": "Health check",
+            "/cache/stats": "Cache statistics"
+        }
+    }
+
+@app.get("/health")
+async def health():
+    browser_status = "healthy" if app_state.browser else "disconnected"
+    return {
+        "status": "healthy",
+        "browser": browser_status,
+        "cache_size": len(app_state.cache),
+        "queue_size": app_state.request_queue.qsize()
+    }
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Get cache statistics"""
+    valid_entries = sum(1 for entry in app_state.cache.values() if is_cache_valid(entry))
+    return {
+        "total_entries": len(app_state.cache),
+        "valid_entries": valid_entries,
+        "expired_entries": len(app_state.cache) - valid_entries
+    }
+
+@app.get("/followers/{username}")
+async def get_followers_endpoint(username: str, background_tasks: BackgroundTasks):
+    # Input validation
+    if not username or not username.strip():
+        raise HTTPException(status_code=400, detail="Username is required")
+    
+    username = username.strip().replace("@", "")
+    
+    if not re.match(r'^[a-zA-Z0-9._-]+$', username):
+        raise HTTPException(status_code=400, detail="Invalid username format")
+    
+    # Rate limiting check
+    if app_state.request_queue.full():
+        raise HTTPException(status_code=429, detail="Server busy, please try again later")
+    
+    try:
+        # Add to queue for rate limiting
+        await app_state.request_queue.put(username)
+        
+        # Get followers count
+        followers = await get_followers_count(username)
+        
+        if followers:
+            formatted = format_followers(followers)
+            
+            # Clean up old cache entries in background
+            background_tasks.add_task(cleanup_expired_cache)
+            
+            return {
+                "username": username,
+                "followers": formatted,
+                "cached": get_cache_key(username) in app_state.cache,
+                "timestamp": datetime.now().isoformat(),
+                "status": "success"
+            }
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail="Could not retrieve followers count. User may not exist or profile may be private."
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error for {username}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        # Remove from queue
+        try:
+            app_state.request_queue.get_nowait()
+            app_state.request_queue.task_done()
+        except asyncio.QueueEmpty:
+            pass
+
+async def cleanup_expired_cache():
+    """Remove expired cache entries"""
+    try:
+        expired_keys = [
+            key for key, entry in app_state.cache.items()
+            if not is_cache_valid(entry)
+        ]
+        for key in expired_keys:
+            del app_state.cache[key]
+        
+        if expired_keys:
+            logger.info(f"Cleaned up {len(expired_keys)} expired cache entries")
+    except Exception as e:
+        logger.error(f"Cache cleanup error: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000), text.strip()):
                         followers = text.strip()
-                        logger.info(f"Found followers: {followers}")
+                        logger.info(f"Found followers via selector '{selector}': {followers}")
                         return followers
             except Exception:
                 continue
         
-        # Fallback: search page content
+        # Final fallback: search page content with multiple strategies
         try:
             content = await page.content()
-            patterns = [
-                r'"followerCount":(\d+)',
-                r'followerCount["\']:\s*["\']?(\d+)',
-                r'([\d,.]+[KMBkmb]?)\s*Followers',
+            
+            # Strategy 1: Look for specific JSON patterns
+            json_patterns = [
+                r'"followerCount["\']?:\s*["\']?(\d+)',
+                r'followerCount["\']:\s*(\d+)',
+                r'"stats"[^}]*"followerCount["\']?:\s*["\']?(\d+)',
             ]
             
-            for pattern in patterns:
+            for pattern in json_patterns:
                 matches = re.findall(pattern, content, re.IGNORECASE)
                 if matches:
                     return matches[0]
-                    
+            
+            # Strategy 2: Look for text patterns
+            text_patterns = [
+                r'([\d,.]+[KMBkmb]?)\s*Followers',
+                r'Followers\s*([\d,.]+[KMBkmb]?)',
+                r'(\d{1,3}(?:,\d{3})*(?:\.\d+)?[KMBkmb]?)\s*followers',
+            ]
+            
+            for pattern in text_patterns:
+                matches = re.findall(pattern, content, re.IGNORECASE)
+                if matches:
+                    # Validate the match looks like a reasonable follower count
+                    match = matches[0]
+                    if re.match(r'^[\d,.KMBkmb]+
+
+async def get_followers_count(username: str) -> Optional[str]:
+    """Main function to get followers count with multiple strategies"""
+    cache_key = get_cache_key(username)
+    
+    # Check cache first
+    if cache_key in app_state.cache:
+        cache_entry = app_state.cache[cache_key]
+        if is_cache_valid(cache_entry):
+            logger.info(f"Cache hit for {username}")
+            return cache_entry["followers"]
+        else:
+            del app_state.cache[cache_key]
+    
+    # Try fast API method first
+    followers = await try_api_method(username)
+    
+    # Fallback to Playwright if API fails
+    if not followers:
+        followers = await scrape_with_playwright(username)
+    
+    # Cache successful results
+    if followers:
+        app_state.cache[cache_key] = {
+            "followers": followers,
+            "timestamp": datetime.now()
+        }
+    
+    return followers
+
+def format_followers(count: str) -> dict:
+    """Format followers count with multiple representations"""
+    if not count:
+        return {"raw": "0", "formatted": "Unknown", "numeric": 0}
+    
+    # Handle K, M, B suffixes
+    multipliers = {"K": 1000, "M": 1000000, "B": 1000000000, "k": 1000, "m": 1000000, "b": 1000000000}
+    
+    numeric_value = 0
+    raw_count = count
+    
+    if count.isdigit():
+        numeric_value = int(count)
+        formatted_count = f"{numeric_value:,}"
+    else:
+        suffix = count[-1]
+        if suffix in multipliers:
+            try:
+                number = float(count[:-1])
+                numeric_value = int(number * multipliers[suffix])
+                formatted_count = f"{numeric_value:,}"
+            except ValueError:
+                formatted_count = count
+        else:
+            formatted_count = count
+    
+    return {
+        "raw": raw_count,
+        "formatted": formatted_count,
+        "numeric": numeric_value
+    }
+
+async def process_queue():
+    """Background task to process requests with rate limiting"""
+    while True:
+        try:
+            # Process queue items with delay to avoid rate limiting
+            if not app_state.request_queue.empty():
+                await asyncio.sleep(1)  # Rate limit: 1 request per second
+        except Exception as e:
+            logger.error(f"Queue processing error: {e}")
+        await asyncio.sleep(0.1)
+
+# API Routes
+@app.get("/")
+async def home():
+    return {
+        "message": "Optimized TikTok Followers API",
+        "version": "2.0",
+        "features": ["Caching", "Rate Limiting", "Multiple Data Sources", "Performance Optimized"],
+        "endpoints": {
+            "/followers/{username}": "Get followers count for a TikTok user",
+            "/health": "Health check",
+            "/cache/stats": "Cache statistics"
+        }
+    }
+
+@app.get("/health")
+async def health():
+    browser_status = "healthy" if app_state.browser else "disconnected"
+    return {
+        "status": "healthy",
+        "browser": browser_status,
+        "cache_size": len(app_state.cache),
+        "queue_size": app_state.request_queue.qsize()
+    }
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Get cache statistics"""
+    valid_entries = sum(1 for entry in app_state.cache.values() if is_cache_valid(entry))
+    return {
+        "total_entries": len(app_state.cache),
+        "valid_entries": valid_entries,
+        "expired_entries": len(app_state.cache) - valid_entries
+    }
+
+@app.get("/followers/{username}")
+async def get_followers_endpoint(username: str, background_tasks: BackgroundTasks):
+    # Input validation
+    if not username or not username.strip():
+        raise HTTPException(status_code=400, detail="Username is required")
+    
+    username = username.strip().replace("@", "")
+    
+    if not re.match(r'^[a-zA-Z0-9._-]+$', username):
+        raise HTTPException(status_code=400, detail="Invalid username format")
+    
+    # Rate limiting check
+    if app_state.request_queue.full():
+        raise HTTPException(status_code=429, detail="Server busy, please try again later")
+    
+    try:
+        # Add to queue for rate limiting
+        await app_state.request_queue.put(username)
+        
+        # Get followers count
+        followers = await get_followers_count(username)
+        
+        if followers:
+            formatted = format_followers(followers)
+            
+            # Clean up old cache entries in background
+            background_tasks.add_task(cleanup_expired_cache)
+            
+            return {
+                "username": username,
+                "followers": formatted,
+                "cached": get_cache_key(username) in app_state.cache,
+                "timestamp": datetime.now().isoformat(),
+                "status": "success"
+            }
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail="Could not retrieve followers count. User may not exist or profile may be private."
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error for {username}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        # Remove from queue
+        try:
+            app_state.request_queue.get_nowait()
+            app_state.request_queue.task_done()
+        except asyncio.QueueEmpty:
+            pass
+
+async def cleanup_expired_cache():
+    """Remove expired cache entries"""
+    try:
+        expired_keys = [
+            key for key, entry in app_state.cache.items()
+            if not is_cache_valid(entry)
+        ]
+        for key in expired_keys:
+            del app_state.cache[key]
+        
+        if expired_keys:
+            logger.info(f"Cleaned up {len(expired_keys)} expired cache entries")
+    except Exception as e:
+        logger.error(f"Cache cleanup error: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000), match):
+                        return match
+                        
         except Exception as e:
             logger.error(f"Content search failed: {e}")
         
@@ -235,7 +650,10 @@ async def scrape_with_playwright(username: str) -> Optional[str]:
         return None
     finally:
         if page:
-            await page.close()
+            try:
+                await page.close()
+            except:
+                pass
 
 async def get_followers_count(username: str) -> Optional[str]:
     """Main function to get followers count with multiple strategies"""
