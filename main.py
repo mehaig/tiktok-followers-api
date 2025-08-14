@@ -14,8 +14,6 @@ app = FastAPI()
 # Global variables for browser instance reuse and caching
 browser = None
 browser_initialized = False
-cache = {}
-cache_timeout = 300  # Cache timeout in seconds (5 minutes)
 
 
 async def init_browser():
@@ -64,20 +62,9 @@ async def get_tiktok_followers_with_playwright(username):
     """
     Scrape TikTok followers count using Playwright to handle JavaScript rendering
     """
-    global browser, cache, cache_timeout
+    global browser
 
-    # Check cache first
-    cache_key = username.lower()
     current_time = datetime.now()
-
-    if cache_key in cache:
-        cached_data = cache[cache_key]
-        if current_time - cached_data["timestamp"] < timedelta(seconds=cache_timeout):
-            logger.info(f"Returning cached result for {username}")
-            return cached_data["followers"]
-        else:
-            # Remove expired cache entry
-            del cache[cache_key]
 
     # Initialize browser if not already done
     if not browser_initialized:
@@ -173,10 +160,6 @@ async def get_tiktok_followers_with_playwright(username):
 
         # Close the page
         await page.close()
-
-        # Cache the result
-        if followers_count:
-            cache[cache_key] = {"followers": followers_count, "timestamp": current_time}
 
         return followers_count
 
